@@ -1360,6 +1360,68 @@ class TelegramAdapter(BasePlatformAdapter):
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             return SendResult(success=False, error=str(e), retryable=not is_timeout)
 
+    async def send_draft_message(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        draft_id: int = 1,
+        metadata: Optional[Dict[str, Any]] = None,
+        parse_mode: Optional[str] = None,
+    ) -> SendResult:
+        """Push an ephemeral draft for native Telegram streaming.
+
+        Bot API 9.3 (Dec 2025) added ``sendMessageDraft``; 9.5 (Mar 2026)
+        opened it to all bots. Calling repeatedly with the same ``draft_id``
+        animates the draft client-side. Drafts are private-chat only,
+        ephemeral (~30s), and do not persist — finalize the stream with a
+        normal ``send`` afterwards. Pass ``content=""`` to clear the draft.
+
+        ``parse_mode`` defaults to plaintext because mid-stream tokens
+        regularly contain unbalanced markdown that MarkdownV2 would reject.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        from telegram.error import BadRequest, RetryAfter
+
+        msg_thread_id = self._message_thread_id_for_send(
+            self._metadata_thread_id(metadata)
+        )
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "draft_id": int(draft_id),
+            "text": content,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+            payload["text"] = self.format_message(content) if content else ""
+        if msg_thread_id is not None:
+            payload["message_thread_id"] = msg_thread_id
+
+        async def _call(p: Dict[str, Any]) -> None:
+            await self._bot.do_api_request("sendMessageDraft", api_kwargs=p)
+
+        try:
+            await _call(payload)
+            return SendResult(success=True, message_id=str(draft_id))
+        except BadRequest as e:
+            if parse_mode and "parse" in str(e).lower():
+                # Drop formatting and retry once as plaintext.
+                payload.pop("parse_mode", None)
+                payload["text"] = content
+                try:
+                    await _call(payload)
+                    return SendResult(success=True, message_id=str(draft_id))
+                except Exception as e2:
+                    return SendResult(success=False, error=f"draft_failed:{e2}")
+            return SendResult(success=False, error=f"draft_failed:{e}")
+        except RetryAfter as e:
+            return SendResult(success=False, error=f"draft_flood:{e.retry_after}")
+        except Exception as e:
+            logger.debug("[%s] Telegram draft stream failed: %s", self.name, e)
+            return SendResult(success=False, error=f"draft_failed:{e}")
+
     async def edit_message(
         self,
         chat_id: str,

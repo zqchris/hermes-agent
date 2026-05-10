@@ -42,6 +42,7 @@ class StreamConsumerConfig:
     """Runtime config for a single stream consumer instance."""
     edit_interval: float = 1.0
     buffer_threshold: int = 40
+    transport: str = "edit"  # "edit", "draft", "auto", or "off"
     cursor: str = " ▉"
     buffer_only: bool = False
     # When >0, the final edit for a streamed response is delivered as a
@@ -123,6 +124,8 @@ class GatewayStreamConsumer:
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
+        self._draft_id: Optional[int] = None
+        self._draft_transport_failed = False
         # Cache adapter lifecycle capability: only platforms that need an
         # explicit finalize call (e.g. DingTalk AI Cards) force us to make
         # a redundant final edit.  Everyone else keeps the fast path.
@@ -174,6 +177,7 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        self._draft_id = None
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread.
@@ -421,7 +425,14 @@ class GatewayStreamConsumer:
                     # here instead of letting the base gateway path send the
                     # full response again.
                     if self._accumulated:
-                        if self._fallback_final_send:
+                        if self._should_use_draft_transport():
+                            # Draft updates are ephemeral. Even if the final
+                            # text was just pushed as a draft in the flush above,
+                            # persist it with a normal platform send here.
+                            self._final_response_sent = await self._send_draft_final(
+                                self._accumulated
+                            )
+                        elif self._fallback_final_send:
                             await self._send_fallback_final(self._accumulated)
                         elif (
                             current_update_visible
@@ -854,6 +865,108 @@ class GatewayStreamConsumer:
         self._final_response_sent = True
         return True
 
+    def _should_use_draft_transport(self) -> bool:
+        """Return True when this stream should use Telegram native drafts."""
+        transport = (getattr(self.cfg, "transport", "edit") or "edit").lower()
+        if transport in {"off", "edit"}:
+            return False
+        if self._draft_transport_failed:
+            return False
+        if not hasattr(self.adapter, "send_draft_message"):
+            return False
+        if transport == "draft":
+            return True
+        if transport == "auto":
+            # Telegram drafts are intended for 1:1 chats. Groups/forums keep
+            # the legacy edit transport to avoid undefined client behaviour.
+            meta = self.metadata or {}
+            chat_type = str(meta.get("chat_type") or "dm").lower()
+            return chat_type in {"dm", "private"}
+        return False
+
+    # Single-slot draft per stream — same id makes the Telegram client
+    # animate text growth in place. The slot is reused across streams in
+    # the same chat; the previous draft is implicitly overwritten.
+    _DRAFT_SLOT_ID = 1
+
+    async def _send_draft_update(self, text: str) -> bool:
+        """Push an ephemeral draft update for intermediate streaming tokens."""
+        draft_fn = getattr(self.adapter, "send_draft_message", None)
+        if draft_fn is None:
+            return False
+        try:
+            result = await draft_fn(
+                chat_id=self.chat_id,
+                content=text,
+                draft_id=self._DRAFT_SLOT_ID,
+                metadata=self.metadata,
+            )
+        except Exception as e:
+            logger.info("Draft stream update raised, falling back to edit: %s", e)
+            self._draft_transport_failed = True
+            return False
+        if getattr(result, "success", False):
+            if self._draft_id is None:
+                logger.info(
+                    "Native draft streaming engaged (chat=%s, slot=%d)",
+                    self.chat_id, self._DRAFT_SLOT_ID,
+                )
+            self._draft_id = self._DRAFT_SLOT_ID
+            self._already_sent = True
+            self._last_sent_text = text
+            return True
+        self._draft_transport_failed = True
+        logger.info(
+            "Draft stream update failed, falling back to edit: %s",
+            getattr(result, "error", "unknown"),
+        )
+        return False
+
+    async def _clear_draft(self) -> None:
+        """Best-effort: empty the draft slot so the ephemeral preview disappears."""
+        if self._draft_id is None:
+            return
+        draft_fn = getattr(self.adapter, "send_draft_message", None)
+        if draft_fn is None:
+            return
+        try:
+            await draft_fn(
+                chat_id=self.chat_id,
+                content="",
+                draft_id=self._draft_id,
+                metadata=self.metadata,
+            )
+        except Exception as e:
+            logger.debug("Draft clear failed (ignored): %s", e)
+        finally:
+            self._draft_id = None
+
+    async def _send_draft_final(self, text: str) -> bool:
+        """Persist the final output then clear the streaming draft."""
+        final_text = self._clean_for_display(text)
+        if not final_text.strip():
+            await self._clear_draft()
+            return True
+        try:
+            result = await self.adapter.send(
+                chat_id=self.chat_id,
+                content=final_text,
+                metadata=self.metadata,
+            )
+        except Exception as e:
+            logger.error("Draft final send error: %s", e)
+            return False
+        if not getattr(result, "success", False):
+            return False
+        self._message_id = str(result.message_id) if getattr(result, "message_id", None) else "__no_edit__"
+        self._message_created_ts = time.monotonic() if self._message_id != "__no_edit__" else None
+        self._already_sent = True
+        self._last_sent_text = final_text
+        self._final_response_sent = True
+        self._notify_new_message()
+        await self._clear_draft()
+        return True
+
     async def _send_or_edit(self, text: str, *, finalize: bool = False) -> bool:
         """Send or edit the streaming message.
 
@@ -893,6 +1006,17 @@ class GatewayStreamConsumer:
                 and self.cfg.cursor in text
                 and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
             return True  # too short for a standalone message — accumulate more
+
+        if self._should_use_draft_transport():
+            # Native Telegram streaming: intermediate deltas are ephemeral
+            # drafts; the final answer is persisted as a normal message.
+            if finalize:
+                return await self._send_draft_final(text)
+            ok = await self._send_draft_update(text)
+            if ok:
+                return True
+            # Fall through to legacy send/edit after one draft failure.
+
         try:
             if self._message_id is not None:
                 if self._edit_supported:

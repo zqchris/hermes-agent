@@ -12925,9 +12925,9 @@ class GatewayRunner:
         )
 
         if source.thread_id:
-            _thread_metadata: Optional[Dict[str, Any]] = {"thread_id": source.thread_id}
+            _thread_metadata: Optional[Dict[str, Any]] = {"thread_id": source.thread_id, "chat_type": source.chat_type}
         else:
-            _thread_metadata = None
+            _thread_metadata = {"chat_type": source.chat_type}
 
         if _streaming_enabled:
             try:
@@ -12952,6 +12952,7 @@ class GatewayRunner:
                     _consumer_cfg = StreamConsumerConfig(
                         edit_interval=_scfg.edit_interval,
                         buffer_threshold=_scfg.buffer_threshold,
+                        transport=getattr(_scfg, "transport", "auto"),
                         cursor=_effective_cursor,
                         buffer_only=_buffer_only,
                         fresh_final_after_seconds=_fresh_final_secs,
@@ -13626,7 +13627,9 @@ class GatewayRunner:
                 "reply_to_message_id": event_message_id,
             }
         else:
-            _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+            _status_thread_metadata = {"chat_type": source.chat_type}
+            if _progress_thread_id:
+                _status_thread_metadata["thread_id"] = _progress_thread_id
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -13768,6 +13771,7 @@ class GatewayRunner:
                         _consumer_cfg = StreamConsumerConfig(
                             edit_interval=_scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
+                            transport=getattr(_scfg, "transport", "auto"),
                             cursor=_effective_cursor,
                             buffer_only=_buffer_only,
                             fresh_final_after_seconds=_fresh_final_secs,
