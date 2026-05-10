@@ -112,31 +112,75 @@ def _codex_curated_models() -> list[str]:
 
 
 # Static fallback for xAI when the models.dev disk cache is empty (fresh
-# install, offline first run, etc.). Mirrors the xAI-direct model IDs from
-# $HERMES_HOME/models_dev_cache.json as of 2026-04-28. Whenever xAI renames
-# or retires a model, the disk cache picks it up on the next refresh and the
-# fallback here only matters until that refresh lands.
+# install, offline first run, etc.). Keep this intentionally curated: xAI's
+# May 2026 migration guide recommends Grok 4.3 for reasoning workloads and
+# Grok 4.20 non-reasoning for non-reasoning workloads; older Grok 2/3/4
+# variants stay manually addressable but should not clutter the model picker.
 _XAI_STATIC_FALLBACK: list[str] = [
+    "grok-4.3",
     "grok-4.20-0309-reasoning",
     "grok-4.20-0309-non-reasoning",
-    "grok-4.20-multi-agent-0309",
+]
+
+_XAI_PREFERRED_MODELS: list[str] = list(_XAI_STATIC_FALLBACK)
+
+_XAI_LEGACY_OR_RETIRING_MODELS: set[str] = {
+    # xAI May 15, 2026 retirement notice / recommended migration targets.
     "grok-4-1-fast",
+    "grok-4-1-fast-reasoning",
     "grok-4-1-fast-non-reasoning",
     "grok-4-fast",
+    "grok-4-fast-reasoning",
     "grok-4-fast-non-reasoning",
     "grok-4",
+    "grok-4-0709",
     "grok-code-fast-1",
-]
+    # Older legacy / beta IDs that make the provider picker noisy.
+    "grok-beta",
+    "grok-vision-beta",
+}
+
+
+def _is_xai_legacy_or_retiring(model_id: str) -> bool:
+    mid = model_id.strip().lower()
+    return (
+        mid in _XAI_LEGACY_OR_RETIRING_MODELS
+        or mid.startswith("grok-2")
+        or mid.startswith("grok-3")
+    )
+
+
+def _order_xai_models(model_ids: list[str]) -> list[str]:
+    """Return a concise, current-first xAI list for the provider picker."""
+    seen: set[str] = set()
+    available: list[str] = []
+    for mid in model_ids:
+        if not isinstance(mid, str):
+            continue
+        mid = mid.strip()
+        key = mid.lower()
+        if not mid or key in seen:
+            continue
+        seen.add(key)
+        available.append(mid)
+
+    preferred = [mid for mid in _XAI_PREFERRED_MODELS if mid in available]
+    preferred_keys = {mid.lower() for mid in preferred}
+    remaining = sorted(
+        mid for mid in available
+        if mid.lower() not in preferred_keys and not _is_xai_legacy_or_retiring(mid)
+    )
+    return preferred + remaining
 
 
 def _xai_curated_models() -> list[str]:
-    """Derive the xAI-direct curated list from models.dev disk cache.
+    """Derive a current xAI-direct curated list from models.dev disk cache.
 
     Reads $HERMES_HOME/models_dev_cache.json directly (no network) so this
-    runs at import time without blocking. Falls back to ``_XAI_STATIC_FALLBACK``
-    when the cache is empty or unreadable. Hermes refreshes the cache from
-    https://models.dev/api.json on normal use, so this list self-heals as
-    xAI renames models.
+    runs at import time without blocking. The cache may contain many legacy
+    Grok aliases; the model picker should stay focused on current, tool-capable
+    API models while still letting manual model names resolve through normal
+    validation.
 
     Mirrors ``_codex_curated_models()``'s role for openai-codex.
     """
@@ -146,9 +190,14 @@ def _xai_curated_models() -> list[str]:
         xai = data.get("xai") if isinstance(data, dict) else None
         models = xai.get("models") if isinstance(xai, dict) else None
         if isinstance(models, dict) and models:
-            ids = [mid for mid in models.keys() if isinstance(mid, str)]
-            if ids:
-                return sorted(ids)
+            ids = [
+                mid for mid, meta in models.items()
+                if isinstance(mid, str)
+                and (not isinstance(meta, dict) or meta.get("tool_call") is not False)
+            ]
+            ordered = _order_xai_models(ids)
+            if ordered:
+                return ordered
     except Exception:
         # Any failure (missing file, malformed JSON, import error)
         # falls through to the static list.
