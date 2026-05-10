@@ -4307,10 +4307,81 @@ class AIAgent:
                 prefix = f"HTTP {status_code}: " if status_code else ""
                 return f"{prefix}{msg[:300]}"
 
+        # Transport wrappers like openai.APIConnectionError often stringify to
+        # just "Connection error.". Include the causal chain so gateway logs can
+        # distinguish DNS/connect/TLS/remote-protocol failures before fallback.
+        cause_parts = []
+        seen = set()
+        cause = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
+        while cause is not None and id(cause) not in seen and len(cause_parts) < 4:
+            seen.add(id(cause))
+            cause_msg = str(cause).strip()
+            cause_parts.append(
+                f"{type(cause).__name__}: {cause_msg[:240]}" if cause_msg else type(cause).__name__
+            )
+            cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+        if cause_parts and raw.strip().lower() in {"connection error.", "connection error", ""}:
+            raw = f"{raw} cause_chain={' <- '.join(cause_parts)}"
+
         # Fallback: truncate the raw string but give more room than 200 chars
         status_code = getattr(error, "status_code", None)
         prefix = f"HTTP {status_code}: " if status_code else ""
         return f"{prefix}{raw[:500]}"
+
+    @staticmethod
+    def _api_error_debug_details(error: Exception) -> Dict[str, Any]:
+        """Return JSON-serializable provider-error details for diagnostics.
+
+        The normal one-line summary is intentionally compact for users, but
+        fallback diagnostics need the raw SDK fields and causal transport chain.
+        This helper avoids leaking request headers while preserving response body
+        and low-level network causes when the provider never returned a body.
+        """
+        details: Dict[str, Any] = {
+            "type": type(error).__name__,
+            "message": str(error),
+        }
+        for attr_name in ("status_code", "request_id", "code", "param", "type"):
+            attr_value = getattr(error, attr_name, None)
+            if attr_value is not None:
+                details[attr_name] = attr_value
+
+        body = getattr(error, "body", None)
+        if body is not None:
+            details["body"] = body
+
+        response_obj = getattr(error, "response", None)
+        if response_obj is not None:
+            try:
+                details["response_status"] = getattr(response_obj, "status_code", None)
+                headers = getattr(response_obj, "headers", None)
+                if headers:
+                    safe_headers = {}
+                    for key in ("content-type", "cf-ray", "x-request-id", "openai-processing-ms"):
+                        value = headers.get(key) or headers.get(key.title())
+                        if value:
+                            safe_headers[key] = value
+                    if safe_headers:
+                        details["response_headers"] = safe_headers
+                text = getattr(response_obj, "text", None)
+                if text:
+                    details["response_text"] = str(text)[:4000]
+            except Exception as exc:
+                details["response_extract_error"] = f"{type(exc).__name__}: {exc}"
+
+        cause_chain = []
+        seen = set()
+        cause = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
+        while cause is not None and id(cause) not in seen and len(cause_chain) < 8:
+            seen.add(id(cause))
+            cause_chain.append({
+                "type": type(cause).__name__,
+                "message": str(cause)[:1000],
+            })
+            cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+        if cause_chain:
+            details["cause_chain"] = cause_chain
+        return details
 
     def _mask_api_key_for_logs(self, key: Optional[str]) -> Optional[str]:
         if not key:
@@ -12630,12 +12701,13 @@ class AIAgent:
                     error_msg = str(api_error).lower()
                     _error_summary = self._summarize_api_error(api_error)
                     logger.warning(
-                        "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
+                        "API call failed (attempt %s/%s) error_type=%s %s summary=%s details=%s",
                         retry_count,
                         max_retries,
                         error_type,
                         self._client_log_context(),
                         _error_summary,
+                        json.dumps(self._api_error_debug_details(api_error), ensure_ascii=False, default=str)[:4000],
                     )
 
                     _provider = getattr(self, "provider", "unknown")
@@ -13168,6 +13240,25 @@ class AIAgent:
                             primary_recovery_attempted = True
                             retry_count = 0
                             continue
+                        # Persist the primary provider failure before switching.
+                        # Once fallback succeeds, the final turn can look healthy
+                        # in session/state logs, so this dump is the durable
+                        # evidence needed to diagnose Codex/Gateway failures.
+                        if api_kwargs is not None:
+                            dump_file = self._dump_api_request_debug(
+                                api_kwargs,
+                                reason="primary_fallback_before_activation",
+                                error=api_error,
+                            )
+                            logging.warning(
+                                "%sPrimary model fallback trigger persisted: provider=%s model=%s error=%s dump=%s details=%s",
+                                self.log_prefix,
+                                _provider,
+                                _model,
+                                _error_summary,
+                                dump_file,
+                                json.dumps(self._api_error_debug_details(api_error), ensure_ascii=False, default=str)[:4000],
+                            )
                         # Try fallback before giving up entirely
                         self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                         if self._try_activate_fallback():
