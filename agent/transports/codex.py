@@ -76,6 +76,20 @@ class ResponsesApiTransport(ProviderTransport):
         is_codex_backend = params.get("is_codex_backend", False)
         is_xai_responses = params.get("is_xai_responses", False)
 
+        if is_xai_responses:
+            # xAI returns HTTP 400 when a conversation replay includes
+            # encrypted reasoning blobs minted by another Responses backend.
+            # Treat Grok requests as stateless text/tool replays and let the
+            # adapter fall back to visible assistant content.
+            sanitized_messages: List[Dict[str, Any]] = []
+            for msg in payload_messages:
+                if isinstance(msg, dict):
+                    clean_msg = dict(msg)
+                    clean_msg.pop("codex_reasoning_items", None)
+                    clean_msg.pop("codex_message_items", None)
+                    sanitized_messages.append(clean_msg)
+            payload_messages = sanitized_messages
+
         # Resolve reasoning effort
         reasoning_effort = "medium"
         reasoning_enabled = True
@@ -89,22 +103,27 @@ class ResponsesApiTransport(ProviderTransport):
         _effort_clamp = {"minimal": "low"}
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
+        converted_tools = _responses_tools(tools)
         kwargs = {
             "model": model,
             "instructions": instructions,
             "input": _chat_messages_to_responses_input(payload_messages),
-            "tools": _responses_tools(tools),
-            "tool_choice": "auto",
-            "parallel_tool_calls": True,
             "store": False,
         }
+        if converted_tools:
+            kwargs["tools"] = converted_tools
+            kwargs["tool_choice"] = "auto"
+            kwargs["parallel_tool_calls"] = True
 
         session_id = params.get("session_id")
         if not is_github_responses and session_id:
             kwargs["prompt_cache_key"] = session_id
 
         if reasoning_enabled and is_xai_responses:
-            kwargs["include"] = ["reasoning.encrypted_content"]
+            # Avoid requesting encrypted reasoning state for xAI until Hermes can
+            # tag replay metadata by provider. Mixed-provider sessions otherwise
+            # can send foreign encrypted_content back to Grok and trigger 400s.
+            pass
         elif reasoning_enabled:
             if is_github_responses:
                 github_reasoning = params.get("github_reasoning_extra")
